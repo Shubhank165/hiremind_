@@ -897,8 +897,17 @@ else:
             workspace = state.get("workspace", {})
             problem = workspace.get("problem", {})
             plan = state.get("interview_plan", []) if state else []
-            show_workspace = bool(workspace.get("active")) or any(
-                isinstance(step, dict) and step.get("type") == "coding" for step in plan
+            role_text = (state.get("role") or "").lower() if state else ""
+            non_tech_keywords = [
+                "manager", "management", "product", "program", "project",
+                "operations", "ops", "marketing", "sales", "hr", "recruit",
+                "finance", "account", "legal", "customer", "support"
+            ]
+            is_technical = not any(k in role_text for k in non_tech_keywords)
+            show_workspace = is_technical and (
+                bool(workspace.get("active")) or any(
+                    isinstance(step, dict) and step.get("type") == "coding" for step in plan
+                )
             )
             if not show_workspace:
                 st.empty()
@@ -916,7 +925,11 @@ else:
 
                 st.markdown(problem.get("description", "No description available"))
 
-            # Test cases preview
+                phases = problem.get("phases", [])
+                if phases:
+                    st.markdown("**Phases:** " + " -> ".join(phases))
+
+                # Test cases preview
                 test_cases = problem.get("test_cases", [])
                 if test_cases:
                     with st.expander("📋 Test Cases", expanded=True):
@@ -924,7 +937,7 @@ else:
                             st.markdown(f"**Test {i+1}**: {tc.get('description', '')}")
                             st.code(f"Input:    {tc.get('input', '')}\nExpected: {tc.get('expected_output', '')}", language="text")
 
-            # Code editor
+                # Code editor
                 st.markdown("#### ✏️ Your Solution")
                 starter_code = workspace.get("user_code", problem.get("starter_code", "# Write your code here\n"))
 
@@ -936,7 +949,7 @@ else:
                     label_visibility="collapsed"
                 )
 
-            # Action buttons
+                # Action buttons
                 col1, col2, col3 = st.columns(3)
 
                 with col1:
@@ -999,29 +1012,29 @@ else:
                                 time.sleep(2)
                                 st.rerun()
 
+                with col3:
+                    if st.button("⏭️ Skip Challenge", use_container_width=True, key="skip_code_btn"):
+                        result = call_api(API["submit_code"], data={
+                            "session_id": st.session_state.session_id,
+                            "code": "# Skipped by candidate"
+                        })
+                        if result:
+                            st.session_state.interview_state = result["state"]
+                            st.rerun()
+
+                # Hints
+                hints = problem.get("hints", [])
+                if hints:
+                    with st.expander("💡 Hints (try without first!)"):
+                        for i, hint in enumerate(hints):
+                            st.markdown(f"**Hint {i+1}:** {hint}")
+
         if st.session_state.interview_started:
             changed = maybe_poll_state()
             if changed:
                 st.rerun()
             time.sleep(0.8)
             st.rerun()
-
-            with col3:
-                if st.button("⏭️ Skip Challenge", use_container_width=True, key="skip_code_btn"):
-                    result = call_api(API["submit_code"], data={
-                        "session_id": st.session_state.session_id,
-                        "code": "# Skipped by candidate"
-                    })
-                    if result:
-                        st.session_state.interview_state = result["state"]
-                        st.rerun()
-
-            # Hints
-            hints = problem.get("hints", [])
-            if hints:
-                with st.expander("💡 Hints (try without first!)"):
-                    for i, hint in enumerate(hints):
-                        st.markdown(f"**Hint {i+1}:** {hint}")
 
         # ── COMPLETE MODE ──
     elif mode == "complete":

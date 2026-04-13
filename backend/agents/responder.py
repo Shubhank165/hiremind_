@@ -163,6 +163,26 @@ async def respond_and_evaluate(state: dict) -> dict:
         action = data.get("action", "continue")
         next_response = data.get("next_response", "Could you elaborate on that?")
 
+        step_type = None
+        if current_step < len(plan) and isinstance(plan[current_step], dict):
+            step_type = plan[current_step].get("type")
+
+        role_lc = role.lower()
+        non_tech_keywords = [
+            "manager", "management", "product", "program", "project",
+            "operations", "ops", "marketing", "sales", "hr", "recruit",
+            "finance", "account", "legal", "customer", "support"
+        ]
+        is_technical = not any(k in role_lc for k in non_tech_keywords)
+
+        if is_technical and step_type == "coding" and not state.get("workspace", {}).get("active", False):
+            action = "workspace"
+            next_response = (
+                "Great. For the final step, we will do a short coding assessment. "
+                "We will go through requirements, edge cases, optimize, and refactor. "
+                "Please complete the task and submit your solution when you're ready."
+            )
+
         # Update cumulative scores
         n = cumulative.get("num_evaluations", 0)
         new_cumulative = {

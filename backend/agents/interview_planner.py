@@ -21,6 +21,8 @@ Eval data: {evaluation_data}
 - Avoid deep implementation details until after the warm-up.
 - Prefer project-specific topics if available, but only after the warm-up.
 - Only include coding tasks for technical roles (software, data, ML, engineering). For management or business roles, do NOT include coding tasks.
+- If you include a coding task, make it the FINAL step.
+- For management/business roles, the final step should be a wrap-up or leadership topic, not coding.
 
 Return JSON only:
 {{

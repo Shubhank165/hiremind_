@@ -239,6 +239,11 @@ async def submit_code(req: SubmitCodeRequest):
     # Run workspace evaluation graph
     try:
         result = await workspace_graph.ainvoke(state)
+        # After coding challenge, generate final report immediately
+        from backend.graph import generate_final_report
+        result = {**state, **result}
+        final_result = await generate_final_report(result)
+        result.update(final_result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Workspace evaluation failed: {str(e)}")
 

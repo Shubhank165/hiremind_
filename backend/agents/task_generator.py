@@ -121,6 +121,9 @@ Detected strengths: {evaluation.get('detected_strengths', [])}
             temperature=0.5,
         )
 
+        # Add phased workflow metadata
+        task_data.setdefault("phases", ["requirements", "edge cases", "optimize", "refactor"])
+
         return {
             "workspace": {
                 "active": True,
@@ -134,9 +137,10 @@ Detected strengths: {evaluation.get('detected_strengths', [])}
             "custom_task_request": ""
         }
 
-    except (json.JSONDecodeError, Exception) as e:
+    except (json.JSONDecodeError, Exception):
         # Fallback task
         fallback_task = _generate_fallback_task(role, current_topic, experience_level)
+        fallback_task.setdefault("phases", ["requirements", "edge cases", "optimize", "refactor"])
         return {
             "workspace": {
                 "active": True,
@@ -149,6 +153,35 @@ Detected strengths: {evaluation.get('detected_strengths', [])}
             "needs_workspace": False,
             "custom_task_request": ""
         }
+    profile = state.get("profile", {})
+    evaluation = state.get("evaluation", {})
+    interview_plan = state.get("interview_plan", [])
+    current_step = state.get("current_step", 0)
+    cumulative = state.get("cumulative_scores", {})
+
+    experience_level = profile.get("experience_level", "mid")
+
+    # Fallback task (should rarely be used now)
+    current_topic = "General Programming"
+    if current_step < len(interview_plan):
+        step_data = interview_plan[current_step]
+        current_topic = step_data.get("topic", "General Programming")
+
+    fallback_task = _generate_fallback_task(role, current_topic, experience_level)
+    return {
+        "workspace": {
+            "active": True,
+            "problem": fallback_task,
+            "user_code": fallback_task["starter_code"],
+            "result": {},
+            "evaluation": {}
+        },
+        "mode": "workspace",
+        "needs_workspace": False,
+        "custom_task_request": ""
+    }
+
+
 
 
 def _generate_fallback_task(role: str, topic: str, level: str) -> dict:
