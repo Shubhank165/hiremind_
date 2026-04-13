@@ -11,12 +11,9 @@ from langgraph.graph import StateGraph, START, END
 from backend.state import InterviewState
 from backend.agents.profile_extractor import extract_profile
 from backend.agents.interview_planner import generate_interview_plan
-from backend.agents.responder import respond_and_evaluate, generate_first_question
+from backend.agents.responder import respond_and_evaluate, generate_first_question, acknowledge_workspace
 from backend.agents.task_generator import generate_task
-from backend.config import settings
-from google import genai
-
-client = genai.Client(api_key=settings.gemini_api_key)
+from backend.utils.llm import generate_json
 
 
 # ────────────────────────────────────────────
@@ -33,6 +30,7 @@ async def evaluate_workspace(state: dict) -> dict:
     eval_prompt = f"""Evaluate this coding solution briefly for a {role} interview.
 
 Problem: {problem.get('title', 'Unknown')}
+Description: {problem.get('description', 'No description provided')}
 Code:
 ```python
 {user_code[:1000]}
@@ -43,16 +41,10 @@ Errors: {result.get('stderr', '')[:300]}
 Output JSON: {{"correctness": 0-1, "code_quality": 0-1, "overall": 0-1, "feedback": "1 sentence"}}"""
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=eval_prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.2,
-                response_mime_type="application/json",
-                max_output_tokens=200,
-            )
+        ws_eval = await generate_json(
+            eval_prompt,
+            temperature=0.2,
         )
-        ws_eval = json.loads(response.text.strip())
     except Exception:
         ws_eval = {"correctness": 0.5, "code_quality": 0.5, "overall": 0.4, "feedback": "Auto-scored"}
 
@@ -70,6 +62,8 @@ async def generate_final_report(state: dict) -> dict:
     cumulative = state.get("cumulative_scores", {})
     history = state.get("conversation_history", [])
     workspace = state.get("workspace", {})
+    workspace_eval = workspace.get("evaluation", {}) if isinstance(workspace, dict) else {}
+    workspace_result = workspace.get("result", {}) if isinstance(workspace, dict) else {}
 
     conv_summary = "\n".join([
         f"{'Q' if m.get('role')=='interviewer' else 'A'}: {m.get('content','')[:150]}"
@@ -79,7 +73,8 @@ async def generate_final_report(state: dict) -> dict:
     report_prompt = f"""Generate interview assessment for {role}.
 Profile: {json.dumps(profile, indent=1)[:800]}
 Scores: {json.dumps(cumulative)}
-Workspace: {json.dumps(workspace.get('evaluation', {}))}
+Workspace Evaluation: {json.dumps(workspace_eval)}
+Workspace Results: {json.dumps(workspace_result)}
 Transcript summary:
 {conv_summary}
 
@@ -91,27 +86,45 @@ Output JSON:
 "suggested_next_steps": "1 sentence"}}"""
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=report_prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.3,
-                response_mime_type="application/json",
-            )
+        report = await generate_json(
+            report_prompt,
+            temperature=0.3,
         )
-        report = json.loads(response.text.strip())
     except Exception:
-        overall = cumulative.get("overall", 0.5)
-        rec = "hire" if overall >= 0.7 else "borderline" if overall >= 0.5 else "no_hire"
-        report = {
-            "overall_score": overall,
-            "recommendation": rec,
-            "strengths": profile.get("strengths", []),
-            "weaknesses": profile.get("weaknesses", []),
-            "skill_breakdown": {},
-            "detailed_feedback": "Automated report based on cumulative scores.",
-            "suggested_next_steps": ""
-        }
+        report = {}
+
+    # Ensure required fields and compute a stable overall score
+    overall = cumulative.get("overall", 0.5)
+    ws_overall = None
+    if isinstance(workspace_eval, dict):
+        ws_overall = workspace_eval.get("overall")
+        if ws_overall is None:
+            c = workspace_eval.get("correctness")
+            q = workspace_eval.get("code_quality")
+            if isinstance(c, (int, float)) and isinstance(q, (int, float)):
+                ws_overall = round((c + q) / 2, 3)
+
+    if isinstance(ws_overall, (int, float)):
+        overall_score = round(overall * 0.7 + ws_overall * 0.3, 3)
+    else:
+        overall_score = round(overall, 3)
+
+    if not isinstance(report, dict):
+        report = {}
+
+    rec = report.get("recommendation")
+    if rec not in ["strong_hire", "hire", "borderline", "no_hire"]:
+        rec = "hire" if overall_score >= 0.7 else "borderline" if overall_score >= 0.5 else "no_hire"
+
+    report = {
+        "overall_score": report.get("overall_score", overall_score),
+        "recommendation": rec,
+        "strengths": report.get("strengths", profile.get("strengths", [])),
+        "weaknesses": report.get("weaknesses", profile.get("weaknesses", [])),
+        "skill_breakdown": report.get("skill_breakdown", {}),
+        "detailed_feedback": report.get("detailed_feedback", "Automated report based on interview signals."),
+        "suggested_next_steps": report.get("suggested_next_steps", "")
+    }
 
     return {"final_report": report, "mode": "complete", "should_end": True}
 
@@ -185,11 +198,11 @@ def build_conversation_graph():
 def build_workspace_graph():
     builder = StateGraph(InterviewState)
     builder.add_node("evaluate_workspace", evaluate_workspace)
-    builder.add_node("first_question", generate_first_question)
+    builder.add_node("acknowledge_workspace", acknowledge_workspace)
 
     builder.add_edge(START, "evaluate_workspace")
-    builder.add_edge("evaluate_workspace", "first_question")
-    builder.add_edge("first_question", END)
+    builder.add_edge("evaluate_workspace", "acknowledge_workspace")
+    builder.add_edge("acknowledge_workspace", END)
     return builder.compile()
 
 

@@ -5,36 +5,27 @@ Two modes: Diagnostic (probe weak areas) and Challenge (push strong candidates).
 """
 
 import json
-from google import genai
+
 from backend.config import settings
+from backend.utils.llm import generate_json
 
-client = genai.Client(api_key=settings.gemini_api_key)
+TASK_GENERATION_PROMPT = """Design a coding challenge.
 
-TASK_GENERATION_PROMPT = """You are an expert coding challenge designer for technical interviews.
-
-## Context
-**Role**: {role}
-**Candidate Experience Level**: {experience_level}
-**Task Trigger Reason**: {trigger_reason}
-
-**Current Topic Being Assessed**: {current_topic}
-**Relevant Skills**: {relevant_skills}
-
-**Candidate's Recent Performance**:
+Role: {role}
+Experience: {experience_level}
+Trigger: {trigger_reason}
+Topic: {current_topic}
+Skills: {relevant_skills}
+Custom Request: {custom_request}
+Recent performance:
 {evaluation_summary}
 
-## Task Design Rules:
-1. The task must be **completable in 5-10 minutes**
-2. It must be **testable** — include clear test cases
-3. Provide **starter code** that sets up the function signature
-4. Difficulty must match the trigger reason:
-   - DIAGNOSTIC: Simpler task targeting the specific weak area
-   - CHALLENGE: Harder task to differentiate strong candidates
-5. The task must be solvable in **Python only**
-6. Include **3-5 test cases** with clear input/output
-7. Do NOT require external libraries — standard library only
+Rules:
+- 5-10 minutes, Python only, no external libs.
+- Include 3-5 test cases and starter code.
+- If 'Custom Request' is present, prioritize its requirements.
 
-## Output Format (JSON only):
+Return JSON only:
 {{
     "title": "Brief descriptive title",
     "description": "Clear problem statement (2-4 paragraphs). Include:\n- What the function should do\n- Input format\n- Output format\n- Constraints\n- At least one example",
@@ -71,6 +62,18 @@ async def generate_task(state: dict) -> dict:
         State update with 'workspace' and 'mode'
     """
     role = state.get("role", "Software Engineer")
+    role_lc = role.lower()
+    non_tech_keywords = [
+        "manager", "management", "product", "program", "project",
+        "operations", "ops", "marketing", "sales", "hr", "recruit",
+        "finance", "account", "legal", "customer", "support"
+    ]
+    if any(k in role_lc for k in non_tech_keywords):
+        return {
+            "mode": "conversation",
+            "needs_workspace": False,
+            "custom_task_request": "",
+        }
     profile = state.get("profile", {})
     evaluation = state.get("evaluation", {})
     interview_plan = state.get("interview_plan", [])
@@ -108,27 +111,15 @@ Detected strengths: {evaluation.get('detected_strengths', [])}
         trigger_reason=trigger_reason,
         current_topic=current_topic,
         relevant_skills=", ".join(relevant_skills) if relevant_skills else "general programming",
+        custom_request=state.get("custom_task_request", "None"),
         evaluation_summary=eval_summary
     )
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.5,
-                response_mime_type="application/json",
-            )
+        task_data = await generate_json(
+            prompt,
+            temperature=0.5,
         )
-
-        task_text = response.text.strip()
-        if task_text.startswith("```"):
-            task_text = task_text.split("\n", 1)[1]
-            if task_text.endswith("```"):
-                task_text = task_text[:-3]
-            task_text = task_text.strip()
-
-        task_data = json.loads(task_text)
 
         return {
             "workspace": {
@@ -139,7 +130,8 @@ Detected strengths: {evaluation.get('detected_strengths', [])}
                 "evaluation": {}
             },
             "mode": "workspace",
-            "needs_workspace": False
+            "needs_workspace": False,
+            "custom_task_request": ""
         }
 
     except (json.JSONDecodeError, Exception) as e:
@@ -154,7 +146,8 @@ Detected strengths: {evaluation.get('detected_strengths', [])}
                 "evaluation": {}
             },
             "mode": "workspace",
-            "needs_workspace": False
+            "needs_workspace": False,
+            "custom_task_request": ""
         }
 
 

@@ -6,39 +6,42 @@ This is the key optimization: 1 call instead of 2-3 per turn.
 
 import json
 from datetime import datetime, timezone
-from google import genai
-from backend.config import settings
 
-client = genai.Client(api_key=settings.gemini_api_key)
+from backend.utils.llm import generate_json, generate_text
 
-COMBINED_PROMPT = """You are a senior technical interviewer for the role of {role}. You must BOTH evaluate the candidate's last answer AND generate your next response in a single step.
+COMBINED_PROMPT = """ROLE: Senior technical interviewer for {role}.
+TASK: Evaluate last answer AND generate next response in one step.
 
-## Rules:
-- Ask ONE clear question at a time
-- Keep your spoken response SHORT (2-4 sentences max)
-- Score HONESTLY — a mediocre answer is 0.4-0.5, not 0.7
-- If the answer is weak/vague, probe deeper on the SAME topic
-- If the answer is strong, move to the next planned topic
-- Never reveal scores to the candidate
-- Be natural — like a real interviewer, not a bot
+Tone:
+- Warm, human, and professional. Use brief greetings or acknowledgments.
+- Avoid blunt or scolding phrasing like "you're off topic". If needed, gently steer back.
+- If the candidate says hello or greets you, reply with a brief hello and proceed.
 
-## Candidate Profile:
-Experience: {experience_level}
-Summary: {profile_summary}
+Rules:
+- Ask exactly ONE question.
+- Keep response 2-4 sentences.
+- If answer weak, give a lower evaluation and ask at most ONE follow-up, then move on.
+- If strong, advance to next plan step.
+- Never reveal scores.
+- If profile has projects, reference them before generic topics.
 
-## Current Plan Step ({step_num}/{total_steps}):
+Candidate profile:
+- experience_level: {experience_level}
+- summary: {profile_summary}
+
+Plan step ({step_num}/{total_steps}):
 {current_plan_step}
 
-## Question You Asked:
+Question asked:
 {question}
 
-## Candidate's Answer:
+Answer:
 {answer}
 
-## Recent Context (last 3 exchanges):
+Recent context:
 {recent_context}
 
-## Output STRICT JSON:
+Return JSON only with this schema:
 {{
     "evaluation": {{
         "correctness": 0.0,
@@ -48,26 +51,25 @@ Summary: {profile_summary}
     }},
     "action": "continue|probe|workspace|end",
     "next_response": "Your natural spoken interviewer response including the next question",
+    "custom_task_request": "Optional: Specific details or constraints for a coding task if action is 'workspace'",
     "detected_strengths": [],
     "detected_weaknesses": []
 }}
 
 Action guide:
-- "continue" = answer was adequate, move to next topic
-- "probe" = answer was weak/vague, ask follow-up on SAME topic
-- "workspace" = candidate needs a coding challenge to verify this skill
-- "end" = all planned topics covered"""
+- continue = move to next topic
+- probe = follow-up on same topic
+- workspace = coding challenge. Use 'custom_task_request' to specify what the candidate should build.
+- end = all planned topics covered"""
 
-FIRST_QUESTION_PROMPT = """You are a senior technical interviewer starting an interview for {role}.
+FIRST_QUESTION_PROMPT = """You are a senior technical interviewer for {role}.
 
-Candidate Profile:
-{profile_summary}
+Start with a warm greeting and a quick intro (you can use a generic name), then ask a high-level background question.
+Candidate profile: {profile_summary}
+First plan topic: {first_topic}
 
-First planned topic: {first_topic}
-
-Generate a warm but professional opening (3-4 sentences). Welcome the candidate, briefly introduce yourself, and ask your first question.
-
-Output ONLY the spoken words — no JSON, no labels."""
+Output 2-4 sentences. Do NOT dive into detailed implementation topics on the first question.
+Avoid generic data-structure questions unless profile is empty."""
 
 
 async def generate_first_question(state: dict) -> dict:
@@ -79,20 +81,14 @@ async def generate_first_question(state: dict) -> dict:
     first_topic = json.dumps(plan[0], indent=2) if plan else '{"topic": "Introduction"}'
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=FIRST_QUESTION_PROMPT.format(
+        question = await generate_text(
+            FIRST_QUESTION_PROMPT.format(
                 role=role,
                 profile_summary=profile.get("summary", "No profile"),
-                first_topic=first_topic
+                first_topic=first_topic,
             ),
-            config=genai.types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=250,
-            )
+            temperature=0.7,
         )
-
-        question = response.text.strip()
         entry = {
             "role": "interviewer",
             "content": question,
@@ -157,23 +153,10 @@ async def respond_and_evaluate(state: dict) -> dict:
     )
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.4,
-                response_mime_type="application/json",
-                max_output_tokens=1500,
-            )
+        data = await generate_json(
+            prompt,
+            temperature=0.4,
         )
-
-        result_text = response.text.strip()
-        if result_text.startswith("```"):
-            result_text = result_text.split("\n", 1)[1]
-            if result_text.endswith("```"):
-                result_text = result_text[:-3]
-
-        data = json.loads(result_text.strip())
 
         # Extract evaluation
         eval_data = data.get("evaluation", {})
@@ -205,7 +188,13 @@ async def respond_and_evaluate(state: dict) -> dict:
         }
 
         # Decide next step
-        should_advance = action == "continue"
+        questions_in_step = sum(
+            1 for m in history
+            if isinstance(m, dict) and m.get("role") == "interviewer" and m.get("step") == current_step
+        )
+        # Keep each plan step to 1-2 questions max.
+        force_advance = questions_in_step >= 1
+        should_advance = action == "continue" or (action == "probe" and force_advance)
         needs_workspace = action == "workspace"
         should_end = action == "end" or current_step >= len(plan) - 1
 
@@ -225,6 +214,7 @@ async def respond_and_evaluate(state: dict) -> dict:
             "cumulative_scores": new_cumulative,
             "current_step": new_step,
             "needs_workspace": needs_workspace,
+            "custom_task_request": data.get("custom_task_request", ""),
             "should_end": should_end,
             "probe_deeper": action == "probe",
         }
@@ -249,6 +239,51 @@ async def respond_and_evaluate(state: dict) -> dict:
             "needs_workspace": False,
             "should_end": False,
             "probe_deeper": False,
+        }
+
+
+async def acknowledge_workspace(state: dict) -> dict:
+    """Generate response after workspace task completion."""
+    role = state.get("role", "Software Engineer")
+    workspace = state.get("workspace", {})
+    problem = workspace.get("problem", {})
+    eval_data = workspace.get("evaluation", {})
+    plan = state.get("interview_plan", [])
+    current_step = state.get("current_step", 0)
+
+    # Advance step
+    new_step = current_step + 1
+    next_topic = plan[new_step].get("topic", "Next Topic") if new_step < len(plan) else "Final Thoughts"
+
+    prompt = f"""You are a senior technical interviewer for {role}.
+The candidate just finished a coding task: {problem.get('title')}.
+Evaluation: {eval_data.get('feedback', 'Completed')}
+Passed tests: {workspace.get('result', {}).get('passed_tests', 0)}/{workspace.get('result', {}).get('total_tests', 0)}
+
+Task: Briefly (1-2 sentences) acknowledge their work/approach and then transition to the next topic: {next_topic}.
+Ask a relevant opening question for the new topic."""
+
+    try:
+        response = await generate_text(prompt, temperature=0.7)
+        entry = {
+            "role": "interviewer",
+            "content": response,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "step": new_step
+        }
+        return {
+            "current_question": response,
+            "conversation_history": [entry],
+            "current_step": new_step,
+            "mode": "conversation"
+        }
+    except Exception:
+        fallback = f"Thanks for working through that coding challenge. Let's move on to discuss {next_topic}. Can you tell me more about your experience with it?"
+        return {
+            "current_question": fallback,
+            "conversation_history": [{"role": "interviewer", "content": fallback, "timestamp": datetime.now(timezone.utc).isoformat(), "step": new_step}],
+            "current_step": new_step,
+            "mode": "conversation"
         }
 
 

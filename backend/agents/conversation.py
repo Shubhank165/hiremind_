@@ -6,10 +6,8 @@ Behaves like a real senior technical interviewer: professional, natural, control
 
 import json
 from datetime import datetime, timezone
-from google import genai
-from backend.config import settings
 
-client = genai.Client(api_key=settings.gemini_api_key)
+from backend.utils.llm import generate_text
 
 INTERVIEWER_SYSTEM_PROMPT = """You are a senior technical interviewer conducting a real interview for the role of {role}. You are professional, articulate, and adaptive.
 
@@ -128,20 +126,11 @@ async def generate_question(state: dict) -> dict:
         )
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=[
-                {"role": "user", "parts": [{"text": INTERVIEWER_SYSTEM_PROMPT.format(role=role)}]},
-                {"role": "model", "parts": [{"text": "Understood. I will conduct this interview professionally and adaptively."}]},
-                {"role": "user", "parts": [{"text": prompt}]}
-            ],
-            config=genai.types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=300,
-            )
+        question_text = await generate_text(
+            prompt,
+            system=INTERVIEWER_SYSTEM_PROMPT.format(role=role),
+            temperature=0.7,
         )
-
-        question_text = response.text.strip()
 
         # Add to conversation history
         new_entry = {

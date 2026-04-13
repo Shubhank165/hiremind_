@@ -304,6 +304,9 @@ def init_session():
         "interview_state": None,
         "interview_started": False,
         "voice_mode": False,
+        "voice_started": False,
+        "last_voice_event": None,
+        "last_state_poll": 0.0,
         "audio_queue": [],
     }
     for k, v in defaults.items():
@@ -339,6 +342,35 @@ def call_api(endpoint: str, method: str = "POST", data: dict = None, files: dict
     except Exception as e:
         st.error(f"❌ API Error: {str(e)}")
         return None
+
+
+def maybe_poll_state():
+    if not st.session_state.interview_started:
+        return
+    if not st.session_state.session_id:
+        return
+    now = time.time()
+    last_poll = st.session_state.get("last_state_poll", 0.0)
+    if (now - last_poll) < 0.8:
+        return
+    st.session_state.last_state_poll = now
+    result = call_api(f"{API['state']}/{st.session_state.session_id}", method="GET")
+    if result and isinstance(result, dict) and result.get("state"):
+        new_state = result["state"]
+        prev_state = st.session_state.get("interview_state") or {}
+        prev_sig = (
+            prev_state.get("current_step"),
+            (prev_state.get("cumulative_scores") or {}).get("num_evaluations"),
+            prev_state.get("mode")
+        )
+        new_sig = (
+            new_state.get("current_step"),
+            (new_state.get("cumulative_scores") or {}).get("num_evaluations"),
+            new_state.get("mode")
+        )
+        st.session_state.interview_state = new_state
+        return new_sig != prev_sig
+    return False
 
 
 def get_score_color(score: float) -> str:
@@ -421,6 +453,7 @@ with st.sidebar:
                     st.session_state.session_id = result["session_id"]
                     st.session_state.interview_state = result["state"]
                     st.session_state.interview_started = True
+                    st.session_state.voice_started = False
                     st.rerun()
     else:
         state = st.session_state.interview_state
@@ -455,6 +488,21 @@ with st.sidebar:
                 st.caption("Scores will appear after your first response")
 
             st.markdown("---")
+
+            # Workspace evaluation summary
+            workspace = state.get("workspace", {})
+            ws_eval = workspace.get("evaluation", {}) if isinstance(workspace, dict) else {}
+            if isinstance(ws_eval, dict) and any(k in ws_eval for k in ("correctness", "code_quality", "overall", "feedback")):
+                st.markdown("### 🧪 Workspace Review")
+                if "correctness" in ws_eval:
+                    render_score_bar("Correctness", ws_eval.get("correctness", 0))
+                if "code_quality" in ws_eval:
+                    render_score_bar("Quality", ws_eval.get("code_quality", 0))
+                if "overall" in ws_eval:
+                    render_score_bar("Overall", ws_eval.get("overall", 0))
+                if ws_eval.get("feedback"):
+                    st.caption(ws_eval.get("feedback"))
+                st.markdown("---")
 
             # Profile summary
             profile = state.get("profile", {})
@@ -548,20 +596,21 @@ else:
             history = state.get("conversation_history", []) if state else []
 
             # Render chat messages
-            chat_html = '<div class="chat-container">'
-            if not history:
-                chat_html += '<p style="color: var(--text-dim); text-align: center; padding: 2rem;">Interview starting...</p>'
+            if not st.session_state.voice_started:
+                st.info("Click 'Start Voice Interview' to begin. The interviewer will start after voice is enabled.")
             else:
-                for msg in history:
-                    if isinstance(msg, dict):
-                        role = msg.get("role", "unknown")
-                        content = msg.get("content", "")
-                        if role == "interviewer":
-                            chat_html += f'<div class="msg-bubble msg-interviewer">{content}</div>'
-                        elif role == "candidate":
-                            chat_html += f'<div class="msg-bubble msg-candidate">{content}</div>'
-            chat_html += '</div>'
-            st.markdown(chat_html, unsafe_allow_html=True)
+                chat_html = '<div class="chat-container">'
+                if history:
+                    for msg in history:
+                        if isinstance(msg, dict):
+                            role = msg.get("role")
+                            content = msg.get("content", "")
+                            if role == "interviewer":
+                                chat_html += f'<div class="msg-bubble msg-interviewer">{content}</div>'
+                            elif role == "candidate":
+                                chat_html += f'<div class="msg-bubble msg-candidate">{content}</div>'
+                chat_html += '</div>'
+                st.markdown(chat_html, unsafe_allow_html=True)
 
             # Current question highlight
             current_q = state.get("current_question", "") if state else ""
@@ -597,6 +646,7 @@ else:
                         })
                         if result:
                             st.session_state.interview_state = result["state"]
+                            st.session_state.voice_started = True
                             st.rerun()
 
             # Continuous Voice Chat (WebRTC/WebSocket directly to FastAPI)
@@ -640,6 +690,12 @@ else:
                     let audioContext = null;
                     let processor = null;
                     let isRecording = false;
+                    let isProcessing = false;
+                    let awaitingResponse = false;
+                    let lastTurnId = null;
+                    let currentAudio = null;
+                    let isSpeaking = false;
+                    let pendingState = null;
 
                     const btn = document.getElementById('toggleBtn');
                     const flushBtn = document.getElementById('flushBtn');
@@ -648,7 +704,11 @@ else:
 
                     async function startVoice() {{
                         try {{
-                            stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+                            stream = await navigator.mediaDevices.getUserMedia({{ audio: {{
+                                echoCancellation: true,
+                                noiseSuppression: true,
+                                autoGainControl: true
+                            }} }});
                             audioContext = new (window.AudioContext || window.webkitAudioContext)({{sampleRate: 16000}});
                             const source = audioContext.createMediaStreamSource(stream);
                             // ScriptProcessor is deprecated but universally supported for raw PCM
@@ -662,12 +722,14 @@ else:
                                 btn.className = "stop";
                                 flushBtn.style.display = "inline-block";
                                 pulse.className = "pulse listening";
-                                window.parent.postMessage({{type: 'voice_started'}}, '*');
+                                window.parent.postMessage({{isStreamlitMessage: true, type: 'streamlit:setComponentValue', value: JSON.stringify({{type: 'voice_started', session_id: '{st.session_state.session_id}'}})}}, '*');
+                                ws.send(JSON.stringify({{action: 'set_manual_flush_only', enabled: true}}));
 
                                 source.connect(processor);
                                 processor.connect(audioContext.destination);
 
                                 processor.onaudioprocess = (e) => {{
+                                    if (isProcessing || isSpeaking) return;
                                     if (ws.readyState === WebSocket.OPEN) {{
                                         const floatData = e.inputBuffer.getChannelData(0);
                                         // Convert to 16-bit PCM
@@ -682,9 +744,13 @@ else:
                             }};
 
                             flushBtn.onclick = () => {{
+                                if (isProcessing) return;
                                 if (ws && ws.readyState === WebSocket.OPEN) {{
                                     status.innerText = "Evaluating...";
                                     pulse.className = "pulse";
+                                    isProcessing = true;
+                                    awaitingResponse = true;
+                                    flushBtn.disabled = true;
                                     ws.send(JSON.stringify({{action: 'flush'}}));
                                 }}
                             }};
@@ -694,19 +760,53 @@ else:
                                 if (data.type === 'processing') {{
                                     status.innerText = "Thinking...";
                                 }}
-                                if (data.type === 'turn_complete' && data.audio) {{
-                                    status.innerText = "Interviewer speaking...";
-                                    pulse.className = "pulse speaking";
+                                if (data.type === 'turn_complete') {{
+                                    if (!awaitingResponse) {{
+                                        return;
+                                    }}
+                                    if (data.turn_id && data.turn_id === lastTurnId) {{
+                                        return;
+                                    }}
+                                    lastTurnId = data.turn_id || Date.now();
+                                    pendingState = data.state || null;
+                                    awaitingResponse = false;
 
-                                    // Play received base64 WAV audio
-                                    const audioPlayer = new Audio("data:audio/wav;base64," + data.audio);
-                                    await audioPlayer.play();
+                                    if (currentAudio) {{
+                                        currentAudio.pause();
+                                        currentAudio.currentTime = 0;
+                                    }}
 
-                                    audioPlayer.onended = () => {{
+                                    if (!data.audio) {{
                                         status.innerText = "Listening...";
                                         pulse.className = "pulse listening";
-                                        // Trigger Streamlit reload to show transcript
-                                        window.parent.postMessage({{type: 'streamlit:setComponentValue', value: Date.now()}}, '*');
+                                        isProcessing = false;
+                                        awaitingResponse = false;
+                                        flushBtn.disabled = false;
+                                        if (pendingState) {{
+                                            window.parent.postMessage({{isStreamlitMessage: true, type: 'streamlit:setComponentValue', value: JSON.stringify({{type: 'voice_state', state: pendingState, session_id: '{st.session_state.session_id}'}})}}, '*');
+                                            pendingState = null;
+                                        }}
+                                        return;
+                                    }}
+
+                                    status.innerText = "Interviewer speaking...";
+                                    pulse.className = "pulse speaking";
+                                    isSpeaking = true;
+
+                                    // Play received base64 WAV audio
+                                    currentAudio = new Audio("data:audio/wav;base64," + data.audio);
+                                    await currentAudio.play();
+
+                                    currentAudio.onended = () => {{
+                                        status.innerText = "Listening...";
+                                        pulse.className = "pulse listening";
+                                        isProcessing = false;
+                                        flushBtn.disabled = false;
+                                        isSpeaking = false;
+                                        if (pendingState) {{
+                                            window.parent.postMessage({{isStreamlitMessage: true, type: 'streamlit:setComponentValue', value: JSON.stringify({{type: 'voice_state', state: pendingState, session_id: '{st.session_state.session_id}'}})}}, '*');
+                                            pendingState = null;
+                                        }}
                                     }};
                                 }}
                             }};
@@ -733,6 +833,11 @@ else:
                         if (processor) {{ processor.disconnect(); processor = null; }}
                         if (stream) {{ stream.getTracks().forEach(t => t.stop()); stream = null; }}
                         ws = null;
+                        isProcessing = false;
+                        lastTurnId = null;
+                        isSpeaking = false;
+                        pendingState = null;
+                        if (currentAudio) {{ currentAudio.pause(); currentAudio = null; }}
 
                         if (activeWs && activeWs.readyState === WebSocket.OPEN && sendFlush) {{
                             try {{ activeWs.send(JSON.stringify({{action: 'flush'}})); }} catch (e) {{}}
@@ -749,6 +854,7 @@ else:
                         btn.innerText = "Start Voice Interview";
                         btn.className = "";
                         flushBtn.style.display = "none";
+                        flushBtn.disabled = false;
                         pulse.className = "pulse";
                         status.innerText = "Ready";
                     }}
@@ -765,108 +871,140 @@ else:
 
             # We use a custom component just to trigger reruns when the JS sends a message
             # The JS handles all audio streaming natively over WS without blocking Streamlit!
-            components.html(voice_client_html, height=150)
+            voice_event = components.html(voice_client_html, height=150)
+            if voice_event:
+                try:
+                    raw_event = voice_event
+                    payload = json.loads(voice_event) if isinstance(voice_event, str) else voice_event
+                    if isinstance(payload, dict):
+                        if payload.get("session_id") == st.session_state.session_id:
+                            if raw_event != st.session_state.last_voice_event:
+                                st.session_state.last_voice_event = raw_event
+                                if payload.get("type") == "voice_state":
+                                    new_state = payload.get("state")
+                                    if isinstance(new_state, dict):
+                                        st.session_state.interview_state = new_state
+                                        st.session_state.voice_started = True
+                                        st.rerun()
+                                elif payload.get("type") == "voice_started":
+                                    st.session_state.voice_started = True
+                                    st.rerun()
+                except Exception:
+                    pass
 
         # ── WORKSPACE MODE ──
         with right_col:
             workspace = state.get("workspace", {})
             problem = workspace.get("problem", {})
+            plan = state.get("interview_plan", []) if state else []
+            show_workspace = bool(workspace.get("active")) or any(
+                isinstance(step, dict) and step.get("type") == "coding" for step in plan
+            )
+            if not show_workspace:
+                st.empty()
+            else:
+                st.markdown("### 🔧 Coding Workspace")
 
-            st.markdown("### 🔧 Coding Workspace")
+                # Problem description
+                st.markdown(f"""
+                <div class="workspace-panel">
+                    <h3>💡 {problem.get('title', 'Coding Challenge')}</h3>
+                    <p><strong>Difficulty:</strong> {problem.get('difficulty', 'medium').upper()} &nbsp;|&nbsp;
+                    <strong>Time Limit:</strong> {problem.get('time_limit_minutes', 10)} minutes</p>
+                </div>
+                """, unsafe_allow_html=True)
 
-            # Problem description
-            st.markdown(f"""
-            <div class="workspace-panel">
-                <h3>💡 {problem.get('title', 'Coding Challenge')}</h3>
-                <p><strong>Difficulty:</strong> {problem.get('difficulty', 'medium').upper()} &nbsp;|&nbsp;
-                <strong>Time Limit:</strong> {problem.get('time_limit_minutes', 10)} minutes</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-            st.markdown(problem.get("description", "No description available"))
+                st.markdown(problem.get("description", "No description available"))
 
             # Test cases preview
-            test_cases = problem.get("test_cases", [])
-            if test_cases:
-                with st.expander("📋 Test Cases", expanded=True):
-                    for i, tc in enumerate(test_cases):
-                        st.markdown(f"**Test {i+1}**: {tc.get('description', '')}")
-                        st.code(f"Input:    {tc.get('input', '')}\nExpected: {tc.get('expected_output', '')}", language="text")
+                test_cases = problem.get("test_cases", [])
+                if test_cases:
+                    with st.expander("📋 Test Cases", expanded=True):
+                        for i, tc in enumerate(test_cases):
+                            st.markdown(f"**Test {i+1}**: {tc.get('description', '')}")
+                            st.code(f"Input:    {tc.get('input', '')}\nExpected: {tc.get('expected_output', '')}", language="text")
 
             # Code editor
-            st.markdown("#### ✏️ Your Solution")
-            starter_code = workspace.get("user_code", problem.get("starter_code", "# Write your code here\n"))
+                st.markdown("#### ✏️ Your Solution")
+                starter_code = workspace.get("user_code", problem.get("starter_code", "# Write your code here\n"))
 
-            user_code = st.text_area(
-                "Code Editor",
-                value=starter_code,
-                height=300,
-                key="code_editor",
-                label_visibility="collapsed"
-            )
+                user_code = st.text_area(
+                    "Code Editor",
+                    value=starter_code,
+                    height=300,
+                    key="code_editor",
+                    label_visibility="collapsed"
+                )
 
             # Action buttons
-            col1, col2, col3 = st.columns(3)
+                col1, col2, col3 = st.columns(3)
 
-            with col1:
-                if st.button("▶️ Run Code", use_container_width=True, key="run_code_btn"):
-                    with st.spinner("Running..."):
-                        result = call_api(API["run_code"], data={
-                            "session_id": st.session_state.session_id,
-                            "code": user_code
-                        })
-                        if result:
-                            exec_result = result.get("execution_result", {})
-                            if exec_result.get("success"):
-                                st.success("✅ Code executed successfully!")
-                            else:
-                                st.error("❌ Execution failed")
+                with col1:
+                    if st.button("▶️ Run Code", use_container_width=True, key="run_code_btn"):
+                        with st.spinner("Running..."):
+                            result = call_api(API["run_code"], data={
+                                "session_id": st.session_state.session_id,
+                                "code": user_code
+                            })
+                            if result:
+                                exec_result = result.get("execution_result", {})
+                                if exec_result.get("success"):
+                                    st.success("✅ Code executed successfully!")
+                                else:
+                                    st.error("❌ Execution failed")
 
-                            if exec_result.get("stdout"):
-                                st.markdown("**Output:**")
-                                st.code(exec_result["stdout"], language="text")
-                            if exec_result.get("stderr"):
-                                st.markdown("**Errors:**")
-                                st.code(exec_result["stderr"], language="text")
-                            if exec_result.get("safety_error"):
-                                st.error(f"🔒 Safety: {exec_result['safety_error']}")
+                                if exec_result.get("stdout"):
+                                    st.markdown("**Output:**")
+                                    st.code(exec_result["stdout"], language="text")
+                                if exec_result.get("stderr"):
+                                    st.markdown("**Errors:**")
+                                    st.code(exec_result["stderr"], language="text")
+                                if exec_result.get("safety_error"):
+                                    st.error(f"🔒 Safety: {exec_result['safety_error']}")
 
-                            # Show test results
-                            test_results = exec_result.get("test_results", [])
-                            if test_results:
-                                passed = sum(1 for t in test_results if t.get("passed"))
-                                total = len(test_results)
-                                st.markdown(f"**Tests: {passed}/{total} passed**")
-                                for tr in test_results:
-                                    icon = "✅" if tr.get("passed") else "❌"
-                                    st.markdown(f"{icon} Test {tr.get('test', '?')}: {tr.get('description', '')}")
-                                    if not tr.get("passed"):
-                                        st.caption(f"Expected: `{tr.get('expected')}` | Got: `{tr.get('actual', tr.get('error', 'N/A'))}`")
+                                # Show test results
+                                test_results = exec_result.get("test_results", [])
+                                if test_results:
+                                    passed = sum(1 for t in test_results if t.get("passed"))
+                                    total = len(test_results)
+                                    st.markdown(f"**Tests: {passed}/{total} passed**")
+                                    for tr in test_results:
+                                        icon = "✅" if tr.get("passed") else "❌"
+                                        st.markdown(f"{icon} Test {tr.get('test', '?')}: {tr.get('description', '')}")
+                                        if not tr.get("passed"):
+                                            st.caption(f"Expected: `{tr.get('expected')}` | Got: `{tr.get('actual', tr.get('error', 'N/A'))}`")
 
-            with col2:
-                if st.button("📤 Submit Solution", type="primary", use_container_width=True, key="submit_code_btn"):
-                    with st.spinner("🧠 Evaluating solution..."):
-                        result = call_api(API["submit_code"], data={
-                            "session_id": st.session_state.session_id,
-                            "code": user_code
-                        })
-                        if result:
-                            st.session_state.interview_state = result["state"]
+                with col2:
+                    if st.button("📤 Submit Solution", type="primary", use_container_width=True, key="submit_code_btn"):
+                        with st.spinner("🧠 Evaluating solution..."):
+                            result = call_api(API["submit_code"], data={
+                                "session_id": st.session_state.session_id,
+                                "code": user_code
+                            })
+                            if result:
+                                st.session_state.interview_state = result["state"]
 
-                            exec_result = result.get("execution_result", {})
-                            passed = exec_result.get("passed_tests", 0)
-                            total = exec_result.get("total_tests", 0)
+                                exec_result = result.get("execution_result", {})
+                                passed = exec_result.get("passed_tests", 0)
+                                total = exec_result.get("total_tests", 0)
 
-                            if passed == total and total > 0:
-                                st.balloons()
-                                st.success(f"🎉 All {total} tests passed!")
-                            elif passed > 0:
-                                st.warning(f"Passed {passed}/{total} tests")
-                            else:
-                                st.error("Tests failed — but your approach matters too!")
+                                if passed == total and total > 0:
+                                    st.balloons()
+                                    st.success(f"🎉 All {total} tests passed!")
+                                elif passed > 0:
+                                    st.warning(f"Passed {passed}/{total} tests")
+                                else:
+                                    st.error("Tests failed — but your approach matters too!")
 
-                            time.sleep(2)
-                            st.rerun()
+                                time.sleep(2)
+                                st.rerun()
+
+        if st.session_state.interview_started:
+            changed = maybe_poll_state()
+            if changed:
+                st.rerun()
+            time.sleep(0.8)
+            st.rerun()
 
             with col3:
                 if st.button("⏭️ Skip Challenge", use_container_width=True, key="skip_code_btn"):

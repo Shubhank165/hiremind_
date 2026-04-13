@@ -5,37 +5,24 @@ Plans are NOT static — they can be regenerated mid-interview based on evaluati
 """
 
 import json
-from google import genai
+
 from backend.config import settings
+from backend.utils.llm import generate_json
 
-client = genai.Client(api_key=settings.gemini_api_key)
+PLANNING_PROMPT = """Design a concise interview plan suitable for a 5-minute demo.
 
-PLANNING_PROMPT = """You are an expert technical interview architect. Design a personalized interview plan based on the candidate's profile and target role.
+Role: {role}
+Profile: {profile}
+Eval data: {evaluation_data}
 
-## Target Role: {role}
+-Rules:
+- Use EXACTLY 5 steps. Do not return more or fewer.
+- Start with 1-2 warm-up steps (background, role motivation, high-level experience).
+- Avoid deep implementation details until after the warm-up.
+- Prefer project-specific topics if available, but only after the warm-up.
+- Only include coding tasks for technical roles (software, data, ML, engineering). For management or business roles, do NOT include coding tasks.
 
-## Candidate Profile:
-{profile}
-
-## Evaluation Data So Far (if any):
-{evaluation_data}
-
-## Design Principles:
-1. **Adaptive difficulty**: Start at the candidate's apparent level, then ramp up
-2. **Weakness probing**: Dedicate steps to areas where confidence is low or gaps exist
-3. **Strength validation**: Include steps that let strong candidates demonstrate mastery
-4. **Workspace checkpoints**: Include 1-2 coding/practical tasks at strategic points
-5. **Natural flow**: Topics should transition smoothly, not feel like random questions
-6. **Time-aware**: Total interview should be {min_steps}-{max_steps} steps
-
-## Step Types:
-- "conceptual" — test understanding of concepts/theory
-- "practical" — test ability to solve problems or design systems
-- "behavioral" — test past experience, decision-making, collaboration
-- "coding" — hands-on workspace task (triggers workspace mode)
-- "system_design" — whiteboard-style system design discussion
-
-## Output Format (JSON only, no markdown):
+Return JSON only:
 {{
     "interview_plan": [
         {{
@@ -79,24 +66,14 @@ async def generate_interview_plan(state: dict) -> dict:
     )
 
     try:
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_model,
-            contents=prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.4,
-                response_mime_type="application/json",
-            )
+        plan_data = await generate_json(
+            prompt,
+            temperature=0.4,
         )
-
-        plan_text = response.text.strip()
-        if plan_text.startswith("```"):
-            plan_text = plan_text.split("\n", 1)[1]
-            if plan_text.endswith("```"):
-                plan_text = plan_text[:-3]
-            plan_text = plan_text.strip()
-
-        plan_data = json.loads(plan_text)
         interview_plan = plan_data.get("interview_plan", [])
+
+        if len(interview_plan) > settings.max_interview_steps:
+            interview_plan = interview_plan[:settings.max_interview_steps]
 
         # Ensure steps are properly numbered
         for i, step in enumerate(interview_plan):

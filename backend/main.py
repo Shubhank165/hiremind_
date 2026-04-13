@@ -297,7 +297,10 @@ async def end_interview(req: EndInterviewRequest):
     state["last_user_response"] = "[Interview ended by candidate]"
 
     try:
-        result = await conversation_graph.ainvoke(state)
+        from backend.graph import generate_final_report
+        result = await generate_final_report(state)
+        state.update(result)
+        result = state
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
 
@@ -346,7 +349,11 @@ async def websocket_voice(websocket: WebSocket, session_id: str):
     accumulator = AudioAccumulator(
         silence_threshold_rms=500,
         silence_duration_sec=settings.voice_silence_seconds,
+        min_chunk_seconds=settings.voice_min_chunk_seconds,
     )
+    turn_id = 0
+    manual_flush_only = True
+    is_processing_turn = False
 
     try:
         while True:
@@ -358,9 +365,10 @@ async def websocket_voice(websocket: WebSocket, session_id: str):
                 audio_chunk = data["bytes"]
                 is_ready = accumulator.add_chunk(audio_chunk)
 
-                if is_ready:
+                if is_ready and not manual_flush_only and not is_processing_turn:
                     # Silence detected → Transcribe accumulated audio
                     audio_bytes = accumulator.get_audio_and_reset()
+                    is_processing_turn = True
                     transcript = await transcribe(audio_bytes)
 
                     if transcript and transcript not in ["[silence]", "[inaudible]"]:
@@ -378,23 +386,32 @@ async def websocket_voice(websocket: WebSocket, session_id: str):
                         # Generate TTS for response
                         response_text = result.get("current_question", "")
                         audio_response = await synthesize(response_text)
+                        turn_id += 1
 
                         await websocket.send_json({
                             "type": "turn_complete",
                             "transcript": transcript,
                             "response": response_text,
                             "audio": base64.b64encode(audio_response).decode() if audio_response else "",
+                            "turn_id": turn_id,
                             "state": _sanitize_state(result)
                         })
+                    is_processing_turn = False
 
             elif "text" in data:
                 # JSON command from client
                 try:
                     cmd = json.loads(data["text"])
-                    if cmd.get("action") == "flush":
+                    if cmd.get("action") == "set_manual_flush_only":
+                        manual_flush_only = bool(cmd.get("enabled", True))
+
+                    elif cmd.get("action") == "flush":
+                        if is_processing_turn:
+                            continue
                         # Flush remaining audio
                         remaining = accumulator.flush()
                         if remaining:
+                            is_processing_turn = True
                             transcript = await transcribe(remaining)
                             if transcript and transcript not in ["[silence]", "[inaudible]"]:
                                 state = sessions[session_id]
@@ -405,19 +422,25 @@ async def websocket_voice(websocket: WebSocket, session_id: str):
 
                                 response_text = result.get("current_question", "")
                                 audio_response = await synthesize(response_text)
+                                turn_id += 1
 
                                 await websocket.send_json({
                                     "type": "turn_complete",
                                     "transcript": transcript,
                                     "response": response_text,
                                     "audio": base64.b64encode(audio_response).decode() if audio_response else "",
+                                    "turn_id": turn_id,
                                     "state": _sanitize_state(result)
                                 })
+                            is_processing_turn = False
 
                     elif cmd.get("action") == "text_input":
                         # Direct text input (fallback mode)
                         text = cmd.get("text", "")
                         if text:
+                            if is_processing_turn:
+                                continue
+                            is_processing_turn = True
                             state = sessions[session_id]
                             state["last_user_response"] = text
                             result = await conversation_graph.ainvoke(state)
@@ -426,14 +449,17 @@ async def websocket_voice(websocket: WebSocket, session_id: str):
 
                             response_text = result.get("current_question", "")
                             audio_response = await synthesize(response_text)
+                            turn_id += 1
 
                             await websocket.send_json({
                                 "type": "turn_complete",
                                 "transcript": text,
                                 "response": response_text,
                                 "audio": base64.b64encode(audio_response).decode() if audio_response else "",
+                                "turn_id": turn_id,
                                 "state": _sanitize_state(result)
                             })
+                            is_processing_turn = False
 
                 except json.JSONDecodeError:
                     pass
