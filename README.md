@@ -148,9 +148,9 @@ eightfold/
 | `MIN_INTERVIEW_STEPS` | `8` | Minimum interview steps |
 
 ## 🧪 Demo Scenario
-1. Upload an ML Engineer resume
+1. Upload an ML Engineer resume.
 2. System extracts: Python (expert), TensorFlow (advanced), SQL (intermediate)
 3. Plan: Intro → ML Concepts → Deep Learning → Coding → System Design → Wrap-up
 4. Adaptive flow: weak on transformers → probing follow-up → coding task on attention
-5. Strong on optimization → harder challenge on distributed training
+5. Strong on optimization → harder challenge on distributed training.
 6. Final report: Overall 72%, Hire recommendation
